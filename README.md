@@ -16,7 +16,9 @@ No Python packages need to be installed.
 python main.py
 ```
 
-Import supported video and image files, then drag items from the media bin into the timeline or use **Add to timeline**. Drag a clip body to reorder it; drag its left/right handles to trim the source in/out points. Click the ruler or timeline to seek, and use **Play**, **Pause**, and **Stop** to preview the sequence with audio. Playback starts immediately and decodes preview frames from the active source clip; MP4 rendering only happens during export. Zoom with `+`/`−` and use the horizontal scrollbar for longer edits.
+Import supported video and image files, then drag items from the media bin into the timeline or use **Add to timeline**. Drag a clip body to reorder it; drag its left/right handles to trim the source in/out points. Click the ruler or timeline to seek. **Stop** pauses at the current time; **|◀** rewinds to the start, and the frame buttons step one frame at a time. Playback starts immediately and decodes preview frames from the active source clip; MP4 rendering only happens during export. Zoom with `+`/`−` and use the horizontal scrollbar for longer edits.
+
+Timeline keyboard shortcuts: **Space** play/pause, **J** or **Left Arrow** previous frame, **Right Arrow** next frame, **K** pause, **L** play, **Home** rewind to start, **End** go to the last frame, **A** or **Ctrl+K** split the clip at the playhead, and **Delete** remove the selected timeline clip. Shortcuts are disabled while editing text fields.
 
 Use **Save Project** or **Save As** to save an editable `.json` project, and **Open Project** to restore it. Media paths are stored relative to the project file when possible; keep the referenced footage in place or move it together with the project. MP4 export normalizes the picture to 1280x720 at 30 fps and includes source audio where available; silent clips receive silence so the sequence stays continuous.
 

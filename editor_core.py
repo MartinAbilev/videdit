@@ -48,6 +48,20 @@ class EditItem:
         return self.end - self.start
 
 
+def split_edit_item(item: EditItem, source_time: float) -> tuple[EditItem, EditItem]:
+    minimum_duration = 1 / 30
+    if (
+        not math.isfinite(source_time)
+        or source_time - item.start < minimum_duration
+        or item.end - source_time < minimum_duration
+    ):
+        raise ValueError("The split must leave at least one frame on both sides.")
+    return (
+        EditItem(item.clip, item.start, source_time),
+        EditItem(item.clip, source_time, item.end),
+    )
+
+
 def load_environment_file(env_path: Path) -> None:
     try:
         lines = env_path.read_text(encoding="utf-8-sig").splitlines()

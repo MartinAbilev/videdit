@@ -18,6 +18,7 @@ from editor_core import (
     local_prompt_plan,
     read_png_frame,
     save_project,
+    split_edit_item,
     vision_prompt_plan,
 )
 
@@ -156,6 +157,15 @@ class EditorCoreTests(unittest.TestCase):
         self.assertEqual(read_png_frame(stream), png)
         self.assertEqual(read_png_frame(stream), png)
         self.assertIsNone(read_png_frame(stream))
+
+    def test_split_edit_item_preserves_source_ranges_and_rejects_edges(self) -> None:
+        original = EditItem(self.clips[0], 2.0, 8.0)
+        left, right = split_edit_item(original, 5.0)
+        self.assertEqual((left.start, left.end), (2.0, 5.0))
+        self.assertEqual((right.start, right.end), (5.0, 8.0))
+        self.assertIs(left.clip, right.clip)
+        with self.assertRaises(ValueError):
+            split_edit_item(original, 2.0)
 
 
 if __name__ == "__main__":

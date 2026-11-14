@@ -23,6 +23,7 @@ from editor_core import (
     load_environment_file,
     read_png_frame,
     save_project,
+    split_edit_item,
     vision_prompt_plan,
 )
 
@@ -83,6 +84,7 @@ class VideoEditor(tk.Tk):
         self.cloud_vision = tk.BooleanVar(value=False)
 
         self._build_ui()
+        self._bind_keyboard_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         self._ui_callbacks_after = self.after(20, self._drain_ui_callbacks)
 
@@ -97,7 +99,7 @@ class VideoEditor(tk.Tk):
             ("Save As", self.save_project_as),
             ("Import media", self.import_media),
             ("Add to timeline", self.add_selected_media),
-            ("Remove", self.remove_timeline_item),
+            ("Delete (Del)", self.remove_timeline_item),
             ("Move up", lambda: self.move_timeline_item(-1)),
             ("Move down", lambda: self.move_timeline_item(1)),
             ("Export MP4", self.export_mp4),
@@ -160,6 +162,16 @@ class VideoEditor(tk.Tk):
         self.play_button = ttk.Button(timeline_header, text="Play", command=self.toggle_playback)
         self.play_button.pack(side="left", padx=(12, 3))
         ttk.Button(timeline_header, text="Stop", command=self.stop_playback).pack(side="left", padx=3)
+        ttk.Button(timeline_header, text="|◀", command=self.rewind_to_start).pack(side="left", padx=3)
+        ttk.Button(
+            timeline_header, text="◀ Frame", command=lambda: self.step_frame(-1)
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            timeline_header, text="Frame ▶", command=lambda: self.step_frame(1)
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            timeline_header, text="Split (A)", command=self.split_clip_at_playhead
+        ).pack(side="left", padx=3)
         ttk.Button(timeline_header, text="−", width=3, command=lambda: self.zoom_timeline(0.8)).pack(
             side="right", padx=(3, 0)
         )
@@ -184,6 +196,7 @@ class VideoEditor(tk.Tk):
         self.timeline_canvas.bind("<ButtonPress-1>", self._timeline_mouse_down)
         self.timeline_canvas.bind("<B1-Motion>", self._timeline_mouse_move)
         self.timeline_canvas.bind("<ButtonRelease-1>", self._timeline_mouse_up)
+        self.timeline_canvas.configure(takefocus=True)
 
         trim = ttk.Frame(timeline_frame, padding=(0, 6, 0, 0))
         trim.pack(fill="x")
@@ -339,6 +352,7 @@ class VideoEditor(tk.Tk):
             self._playhead = min(self._playhead, sum(item.duration for item in self.timeline))
         self._draw_timeline()
         if self.selected_index is not None:
+            self.timeline_canvas.focus_set()
             self._show_edit_item(self.selected_index)
         self.status.set(f"Timeline: {len(self.timeline)} clip(s), {sum(i.duration for i in self.timeline):.1f}s.")
 
@@ -498,6 +512,7 @@ class VideoEditor(tk.Tk):
         self._draw_timeline()
 
     def _timeline_mouse_down(self, event: tk.Event) -> None:
+        self.timeline_canvas.focus_set()
         x = self.timeline_canvas.canvasx(event.x)
         y = event.y
         positions = self._timeline_positions()
@@ -962,22 +977,87 @@ class VideoEditor(tk.Tk):
         self.status.set(f"Paused at {self._playhead:.2f}s.")
 
     def stop_playback(self) -> None:
-        self._playing = False
-        self._playback_generation += 1
-        if self._playback_after is not None:
-            self.after_cancel(self._playback_after)
-            self._playback_after = None
-        if self._seek_audio_after is not None:
-            self.after_cancel(self._seek_audio_after)
-            self._seek_audio_after = None
-        self._stop_playback_audio()
-        self._stop_video_stream()
+        self._pause_playback()
+        self.status.set(f"Stopped at {self._playhead:.2f}s.")
+
+    def rewind_to_start(self) -> None:
+        if self._playing:
+            self._pause_playback()
         self._playhead = 0.0
-        self.play_button.configure(text="Play")
         self._update_playhead()
         if self.timeline:
             self._preview_timeline_time(0.0)
-        self.status.set("Playback stopped.")
+        self.status.set("At sequence start.")
+
+    def step_frame(self, direction: int) -> None:
+        if not self.timeline:
+            return
+        if self._playing:
+            self._pause_playback()
+        frame_duration = 1 / 30
+        self._seek_timeline(self._playhead + frame_duration * (1 if direction > 0 else -1))
+
+    def split_clip_at_playhead(self) -> None:
+        if not self.timeline:
+            self.status.set("Add a clip before splitting.")
+            return
+        if self._playing:
+            self._pause_playback()
+        active = self._timeline_item_at(self._playhead)
+        if active is None:
+            self.status.set("No clip at the playhead.")
+            return
+        index, item, _, remaining = active
+        offset = item.duration - remaining
+        source_time = item.start + offset
+        try:
+            left, right = split_edit_item(item, source_time)
+        except ValueError:
+            self.status.set("Move the playhead inside a clip to split it.")
+            return
+
+        self._invalidate_playback()
+        self.timeline[index : index + 1] = [left, right]
+        self._refresh_timeline(index + 1)
+        self.status.set(f"Split {item.clip.name} at {self._playhead:.2f}s.")
+
+    def _bind_keyboard_shortcuts(self) -> None:
+        self.bind_all("<KeyPress>", self._on_keyboard_shortcut, add="+")
+
+    def _on_keyboard_shortcut(self, event: tk.Event) -> str | None:
+        if isinstance(event.widget, (tk.Text, tk.Entry, ttk.Entry, ttk.Combobox)):
+            return None
+
+        key = event.keysym.lower()
+        control_pressed = bool(event.state & 0x4)
+        if control_pressed and key == "k":
+            self.split_clip_at_playhead()
+        elif key == "space":
+            if isinstance(event.widget, ttk.Button):
+                return None
+            self.toggle_playback()
+        elif key in ("left", "j"):
+            self.step_frame(-1)
+        elif key in ("right",):
+            self.step_frame(1)
+        elif key == "home":
+            self.rewind_to_start()
+        elif key == "end":
+            if self.timeline:
+                self._seek_timeline(max(0.0, sum(item.duration for item in self.timeline) - 1 / 30))
+        elif key == "a":
+            self.split_clip_at_playhead()
+        elif key == "delete":
+            self.remove_timeline_item()
+        elif key == "k":
+            if self._playing:
+                self._pause_playback()
+        elif key == "l":
+            if not self._playing:
+                self.toggle_playback()
+        else:
+            return None
+        return "break"
 
     def _seek_timeline(self, at_seconds: float) -> None:
         duration = sum(item.duration for item in self.timeline)
