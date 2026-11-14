@@ -11,11 +11,12 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from urllib.error import URLError
+from typing import Any, BinaryIO
+from urllib.error import HTTPError, URLError
 
 
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+ENVIRONMENT_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,45 @@ class EditItem:
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+
+def load_environment_file(env_path: Path) -> None:
+    try:
+        lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return
+
+    parsed: dict[str, str] = {}
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ValueError(f"{env_path.name}:{line_number}: expected KEY=value.")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not ENVIRONMENT_KEY_PATTERN.fullmatch(key):
+            raise ValueError(f"{env_path.name}:{line_number}: invalid environment variable name.")
+
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            closing_quote = value.find(quote, 1)
+            if closing_quote < 0:
+                raise ValueError(f"{env_path.name}:{line_number}: unterminated quoted value.")
+            remainder = value[closing_quote + 1 :].strip()
+            if remainder and not remainder.startswith("#"):
+                raise ValueError(f"{env_path.name}:{line_number}: unexpected text after quoted value.")
+            value = value[1:closing_quote]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        parsed[key] = value
+
+    for key, value in parsed.items():
+        if not os.environ.get(key):
+            os.environ[key] = value
 
 
 def save_project(
@@ -274,6 +314,36 @@ def extract_sample_frame(clip: Clip, at_seconds: float) -> bytes:
         image_path.unlink(missing_ok=True)
 
 
+def read_png_frame(stream: BinaryIO) -> bytes | None:
+    first_byte = stream.read(1)
+    if not first_byte:
+        return None
+    signature = first_byte + _read_stream_bytes(stream, 7)
+    if signature != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError("FFmpeg preview stream did not contain a PNG frame.")
+
+    frame = bytearray(signature)
+    while True:
+        header = _read_stream_bytes(stream, 8)
+        length = int.from_bytes(header[:4], "big")
+        if length > 64 * 1024 * 1024:
+            raise RuntimeError("FFmpeg preview frame is unexpectedly large.")
+        frame.extend(header)
+        frame.extend(_read_stream_bytes(stream, length + 4))
+        if header[4:8] == b"IEND":
+            return bytes(frame)
+
+
+def _read_stream_bytes(stream: BinaryIO, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        chunk = stream.read(size - len(result))
+        if not chunk:
+            raise RuntimeError("FFmpeg preview stream ended in the middle of a frame.")
+        result.extend(chunk)
+    return bytes(result)
+
+
 def vision_prompt_plan(
     clips: list[Clip],
     prompt: str,
@@ -284,7 +354,7 @@ def vision_prompt_plan(
     if not clips:
         raise ValueError("Import at least one video or image first.")
     if not api_key:
-        raise ValueError("Set OPENAI_API_KEY before using cloud vision.")
+        raise ValueError("Set OPENAI_API_KEY before using GPT vision via the API.")
 
     content: list[dict[str, Any]] = [
         {
@@ -350,8 +420,28 @@ def vision_prompt_plan(
     try:
         with urllib.request.urlopen(request, timeout=90) as response:
             response_body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        try:
+            error_body = json.loads(error.read().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            error_body = {}
+        error_info = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+        provider_message = (
+            error_info.get("message", "") if isinstance(error_info, dict) else ""
+        )
+        if not isinstance(provider_message, str):
+            provider_message = ""
+        if error.code == 429:
+            details = f" {provider_message}" if provider_message else ""
+            raise RuntimeError(
+                "GPT API rate limit (HTTP 429). Wait before retrying, check API usage "
+                "and billing limits, or try fewer/shorter clips."
+                f"{details}"
+            ) from error
+        details = f": {provider_message}" if provider_message else f": {error.reason}"
+        raise RuntimeError(f"GPT API request failed (HTTP {error.code}){details}") from error
     except (OSError, TimeoutError, URLError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Cloud vision request failed: {error}") from error
+        raise RuntimeError(f"GPT API request failed: {error}") from error
 
     try:
         response_text = response_body["choices"][0]["message"]["content"]

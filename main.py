@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import base64
 import os
+import queue
 import subprocess
 import threading
-import tempfile
 import time
 import tkinter as tk
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
 from editor_core import (
     Clip,
@@ -19,6 +20,8 @@ from editor_core import (
     local_prompt_plan,
     probe_clip,
     load_project,
+    load_environment_file,
+    read_png_frame,
     save_project,
     vision_prompt_plan,
 )
@@ -33,6 +36,11 @@ MEDIA_TYPES = [
 class VideoEditor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        try:
+            load_environment_file(Path(__file__).with_name(".env"))
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not load .env", str(error))
+            raise SystemExit(1) from error
         self.title("PromptCut — Video Editor")
         self.geometry("1180x760")
         self.minsize(900, 600)
@@ -41,6 +49,7 @@ class VideoEditor(tk.Tk):
         self.timeline: list[EditItem] = []
         self.selected_index: int | None = None
         self.preview_image: tk.PhotoImage | None = None
+        self.preview_display_image: tk.PhotoImage | None = None
         self._busy = False
         self.project_path: Path | None = None
         self._pixels_per_second = 60.0
@@ -51,17 +60,23 @@ class VideoEditor(tk.Tk):
         self._media_dragged = False
         self._playhead = 0.0
         self._playing = False
-        self._preparing_playback = False
-        self._playback_path: Path | None = None
-        self._playback_clip: Clip | None = None
         self._playback_process: subprocess.Popen[bytes] | None = None
+        self._audio_timeline_index: int | None = None
+        self._video_process: subprocess.Popen[bytes] | None = None
+        self._video_timeline_index: int | None = None
+        self._video_stream_token = 0
         self._playback_started = 0.0
         self._playback_offset = 0.0
         self._playback_after: str | None = None
         self._seek_audio_after: str | None = None
         self._playback_generation = 0
+        self._playback_frame_token = 0
+        self._preview_generation = 0
         self._frame_pending = False
         self._last_frame_request = 0.0
+        self._ui_callbacks: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._ui_callbacks_after: str | None = None
+        self._closing = False
         self.status = tk.StringVar(value="Import videos or images to get started.")
         self.in_value = tk.StringVar(value="0.00")
         self.out_value = tk.StringVar(value="0.00")
@@ -69,6 +84,7 @@ class VideoEditor(tk.Tk):
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self._ui_callbacks_after = self.after(20, self._drain_ui_callbacks)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -111,7 +127,7 @@ class VideoEditor(tk.Tk):
         self.prompt.insert("1.0", "Create a short, energetic edit with the best moments.")
         ttk.Checkbutton(
             library,
-            text="Use cloud vision (uploads sample frames)",
+            text="Use GPT vision API (uploads sample frames)",
             variable=self.cloud_vision,
         ).pack(anchor="w", pady=(7, 2))
         ttk.Label(
@@ -633,78 +649,66 @@ class VideoEditor(tk.Tk):
             self._show_clip(self.media[selection[0]], 0.0)
 
     def toggle_playback(self) -> None:
-        if self._preparing_playback:
-            return
         if self._playing:
             self._pause_playback()
             return
         if not self.timeline:
             messagebox.showerror("Empty timeline", "Add clips before playing the sequence.")
             return
-        if self._playback_path is None:
-            self._prepare_playback()
-            return
         self._start_playback()
-
-    def _prepare_playback(self) -> None:
-        descriptor, filename = tempfile.mkstemp(suffix=".mp4", prefix="promptcut-preview-")
-        os.close(descriptor)
-        path = Path(filename)
-        items = [EditItem(item.clip, item.start, item.end) for item in self.timeline]
-        generation = self._playback_generation
-        self._preparing_playback = True
-        self.play_button.configure(state="disabled")
-        self.status.set("Preparing sequence playback…")
-
-        def worker() -> None:
-            try:
-                self._render_mp4(items, path)
-                self.after(0, lambda: self._playback_ready(path, generation))
-            except (OSError, RuntimeError, ValueError) as error:
-                path.unlink(missing_ok=True)
-                self.after(0, lambda: self._playback_prepare_failed(str(error), generation))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _playback_ready(self, path: Path, generation: int) -> None:
-        if generation != self._playback_generation:
-            path.unlink(missing_ok=True)
-            return
-        self._preparing_playback = False
-        self.play_button.configure(state="normal")
-        self._playback_path = path
-        duration = sum(item.duration for item in self.timeline)
-        self._playback_clip = Clip(path, duration, False, True, 1280, 720)
-        self._playhead = min(self._playhead, duration)
-        self._draw_timeline()
-        self._start_playback()
-
-    def _playback_prepare_failed(self, details: str, generation: int) -> None:
-        if generation != self._playback_generation:
-            return
-        self._preparing_playback = False
-        self.play_button.configure(state="normal")
-        self._show_error("Could not prepare playback", details)
 
     def _start_playback(self) -> None:
-        if self._playback_path is None:
-            return
-        try:
-            self._start_playback_audio()
-        except OSError as error:
-            self._show_error("Could not start playback", str(error))
-            return
+        duration = sum(item.duration for item in self.timeline)
+        if self._playhead >= duration:
+            self._playhead = 0.0
+        self._playback_generation += 1
+        self._preview_generation += 1
         self._playing = True
         self._playback_offset = self._playhead
         self._playback_started = time.monotonic()
         self.play_button.configure(text="Pause")
-        self.status.set("Playing sequence.")
+        try:
+            self._start_playback_audio(force=True)
+        except OSError as error:
+            self.status.set(f"Playing video preview; audio unavailable: {error}")
+        else:
+            self.status.set("Playing sequence.")
+        try:
+            self._start_video_stream(force=True)
+        except (OSError, RuntimeError) as error:
+            self._pause_playback()
+            self._show_error("Preview playback failed", str(error))
+            return
         self._schedule_playback_tick()
 
-    def _start_playback_audio(self) -> None:
-        if self._playback_path is None:
+    def _timeline_item_at(
+        self, at_seconds: float
+    ) -> tuple[int, EditItem, float, float] | None:
+        cursor = 0.0
+        for index, item in enumerate(self.timeline):
+            item_end = cursor + item.duration
+            if at_seconds < item_end or index == len(self.timeline) - 1:
+                offset = max(0.0, min(at_seconds - cursor, item.duration))
+                source_time = min(
+                    item.start + offset,
+                    max(item.start, item.end - 0.05),
+                )
+                return index, item, source_time, max(0.0, item.duration - offset)
+            cursor = item_end
+        return None
+
+    def _start_playback_audio(self, force: bool = False) -> None:
+        active = self._timeline_item_at(self._playhead)
+        if active is None:
+            self._stop_playback_audio()
+            return
+        index, item, source_time, remaining = active
+        if not force and self._audio_timeline_index == index:
             return
         self._stop_playback_audio()
+        self._audio_timeline_index = index
+        if not item.clip.has_audio:
+            return
         self._playback_process = subprocess.Popen(
             [
                 "ffplay",
@@ -713,9 +717,11 @@ class VideoEditor(tk.Tk):
                 "-loglevel",
                 "error",
                 "-ss",
-                f"{self._playhead:.3f}",
+                f"{source_time:.3f}",
                 "-i",
-                str(self._playback_path),
+                str(item.clip.path),
+                "-t",
+                f"{remaining:.3f}",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -725,6 +731,7 @@ class VideoEditor(tk.Tk):
     def _stop_playback_audio(self) -> None:
         process = self._playback_process
         self._playback_process = None
+        self._audio_timeline_index = None
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -732,6 +739,121 @@ class VideoEditor(tk.Tk):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+    def _start_video_stream(self, force: bool = False) -> None:
+        active = self._timeline_item_at(self._playhead)
+        if active is None:
+            self._stop_video_stream()
+            return
+        index, item, source_time, remaining = active
+        process = self._video_process
+        if (
+            not force
+            and self._video_timeline_index == index
+            and process is not None
+            and process.poll() is None
+        ):
+            return
+        self._stop_video_stream()
+        self._video_timeline_index = index
+        if item.clip.is_image:
+            self._request_playback_frame(self._playhead)
+            return
+
+        process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-re",
+                "-ss",
+                f"{source_time:.3f}",
+                "-i",
+                str(item.clip.path),
+                "-t",
+                f"{remaining:.3f}",
+                "-an",
+                "-vf",
+                "fps=12,scale=512:288:force_original_aspect_ratio=decrease,"
+                "pad=512:288:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        self._video_process = process
+        self._video_stream_token += 1
+        token = self._video_stream_token
+        generation = self._playback_generation
+
+        def worker() -> None:
+            try:
+                if process.stdout is None:
+                    raise RuntimeError("Could not read FFmpeg preview frames.")
+                while not self._closing:
+                    frame = read_png_frame(process.stdout)
+                    if frame is None:
+                        break
+                    self._post_to_ui(
+                        lambda frame=frame: self._display_stream_frame(
+                            generation, token, index, frame
+                        )
+                    )
+                return_code = process.wait()
+                if return_code:
+                    self._post_to_ui(
+                        lambda: self._video_stream_failed(
+                            generation, token, "FFmpeg stopped before finishing the preview."
+                        )
+                    )
+            except (OSError, RuntimeError) as error:
+                details = str(error)
+                self._post_to_ui(
+                    lambda: self._video_stream_failed(generation, token, details)
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_video_stream(self) -> None:
+        self._video_stream_token += 1
+        self._video_timeline_index = None
+        process = self._video_process
+        self._video_process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def _display_stream_frame(
+        self, generation: int, token: int, index: int, frame: bytes
+    ) -> None:
+        if (
+            generation != self._playback_generation
+            or token != self._video_stream_token
+            or not self._playing
+        ):
+            return
+        active = self._timeline_item_at(self._playhead)
+        if active is not None and active[0] == index:
+            self._set_preview(frame, "Sequence playback", update_status=False)
+
+    def _video_stream_failed(self, generation: int, token: int, details: str) -> None:
+        if (
+            generation != self._playback_generation
+            or token != self._video_stream_token
+            or not self._playing
+        ):
+            return
+        self._pause_playback()
+        self._show_error("Preview playback failed", details)
 
     def _schedule_playback_tick(self) -> None:
         if self._playing:
@@ -747,41 +869,80 @@ class VideoEditor(tk.Tk):
             self._playback_offset + time.monotonic() - self._playback_started,
         )
         self._update_playhead()
-        now = time.monotonic()
-        if (
-            self._playback_clip is not None
-            and not self._frame_pending
-            and now - self._last_frame_request >= 0.3
-        ):
-            self._request_playback_frame(self._playhead)
-            self._last_frame_request = now
         if self._playhead >= duration:
             self.stop_playback()
             return
+        active = self._timeline_item_at(self._playhead)
+        if active is not None and self._audio_timeline_index != active[0]:
+            try:
+                self._start_playback_audio()
+            except OSError as error:
+                self.status.set(f"Playing video preview; audio unavailable: {error}")
+        if active is not None and self._video_timeline_index != active[0]:
+            try:
+                self._start_video_stream(force=True)
+            except (OSError, RuntimeError) as error:
+                self._pause_playback()
+                self._show_error("Preview playback failed", str(error))
+                return
         self._schedule_playback_tick()
 
     def _request_playback_frame(self, at_seconds: float) -> None:
-        clip = self._playback_clip
-        if clip is None:
+        active = self._timeline_item_at(at_seconds)
+        if active is None or self._frame_pending:
             return
+        index, item, source_time, _ = active
         self._frame_pending = True
         generation = self._playback_generation
-        at_seconds = min(at_seconds, max(0.0, clip.duration - 0.05))
+        self._playback_frame_token += 1
+        frame_token = self._playback_frame_token
+        requested_timeline_time = at_seconds
 
         def worker() -> None:
             try:
-                frame = extract_sample_frame(clip, at_seconds)
-            except (OSError, RuntimeError):
-                self.after(0, lambda: self._finish_playback_frame(generation, None))
+                frame = extract_sample_frame(item.clip, source_time)
+            except (OSError, RuntimeError) as error:
+                details = str(error)
+                self._post_to_ui(
+                    lambda: self._finish_playback_frame(
+                        generation, frame_token, index, requested_timeline_time, None, details
+                    )
+                )
                 return
-            self.after(0, lambda: self._finish_playback_frame(generation, frame))
+            self._post_to_ui(
+                lambda: self._finish_playback_frame(
+                    generation, frame_token, index, requested_timeline_time, frame
+                )
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_playback_frame(self, generation: int, frame: bytes | None) -> None:
-        self._frame_pending = False
-        if generation != self._playback_generation or frame is None:
+    def _finish_playback_frame(
+        self,
+        generation: int,
+        frame_token: int,
+        index: int,
+        requested_timeline_time: float,
+        frame: bytes | None,
+        error: str | None = None,
+    ) -> None:
+        if frame_token != self._playback_frame_token:
             return
+        self._frame_pending = False
+        if generation != self._playback_generation:
+            return
+        if error is not None:
+            self._pause_playback()
+            self._show_error("Playback preview failed", error)
+            return
+        if frame is None:
+            return
+        if self._playing:
+            active = self._timeline_item_at(self._playhead)
+            if active is None or active[0] != index or abs(
+                self._playhead - requested_timeline_time
+            ) > 0.75:
+                return
         self._set_preview(frame, "Sequence playback", update_status=False)
 
     def _pause_playback(self) -> None:
@@ -795,16 +956,14 @@ class VideoEditor(tk.Tk):
             self.after_cancel(self._playback_after)
             self._playback_after = None
         self._stop_playback_audio()
+        self._stop_video_stream()
         self.play_button.configure(text="Play")
         self._update_playhead()
         self.status.set(f"Paused at {self._playhead:.2f}s.")
 
     def stop_playback(self) -> None:
-        if self._preparing_playback:
-            self._invalidate_playback()
-            self.status.set("Playback preparation cancelled.")
-            return
         self._playing = False
+        self._playback_generation += 1
         if self._playback_after is not None:
             self.after_cancel(self._playback_after)
             self._playback_after = None
@@ -812,6 +971,7 @@ class VideoEditor(tk.Tk):
             self.after_cancel(self._seek_audio_after)
             self._seek_audio_after = None
         self._stop_playback_audio()
+        self._stop_video_stream()
         self._playhead = 0.0
         self.play_button.configure(text="Play")
         self._update_playhead()
@@ -826,6 +986,12 @@ class VideoEditor(tk.Tk):
         if self._playing:
             self._playback_offset = self._playhead
             self._playback_started = time.monotonic()
+            try:
+                self._start_video_stream(force=True)
+            except (OSError, RuntimeError) as error:
+                self._pause_playback()
+                self._show_error("Preview playback failed", str(error))
+                return
             if self._seek_audio_after is not None:
                 self.after_cancel(self._seek_audio_after)
             self._seek_audio_after = self.after(180, self._restart_playback_audio)
@@ -837,10 +1003,9 @@ class VideoEditor(tk.Tk):
         if not self._playing:
             return
         try:
-            self._start_playback_audio()
+            self._start_playback_audio(force=True)
         except OSError as error:
-            self._pause_playback()
-            self._show_error("Could not seek playback", str(error))
+            self.status.set(f"Playing video preview; audio unavailable: {error}")
         self._playback_offset = self._playhead
         self._playback_started = time.monotonic()
 
@@ -859,7 +1024,6 @@ class VideoEditor(tk.Tk):
 
     def _invalidate_playback(self) -> None:
         self._playback_generation += 1
-        self._preparing_playback = False
         self._playing = False
         if self._playback_after is not None:
             self.after_cancel(self._playback_after)
@@ -868,29 +1032,73 @@ class VideoEditor(tk.Tk):
             self.after_cancel(self._seek_audio_after)
             self._seek_audio_after = None
         self._stop_playback_audio()
-        self._playback_clip = None
-        if self._playback_path is not None:
-            self._playback_path.unlink(missing_ok=True)
-            self._playback_path = None
+        self._stop_video_stream()
         if hasattr(self, "play_button"):
             self.play_button.configure(text="Play", state="normal")
 
     def close_app(self) -> None:
+        self._closing = True
+        if self._ui_callbacks_after is not None:
+            self.after_cancel(self._ui_callbacks_after)
+            self._ui_callbacks_after = None
         self._invalidate_playback()
         self.destroy()
 
+    def _post_to_ui(self, callback: Callable[[], None]) -> None:
+        if not self._closing:
+            self._ui_callbacks.put(callback)
+
+    def _drain_ui_callbacks(self) -> None:
+        self._ui_callbacks_after = None
+        if self._closing:
+            return
+        while True:
+            try:
+                callback = self._ui_callbacks.get_nowait()
+            except queue.Empty:
+                break
+            callback()
+        if not self._closing:
+            self._ui_callbacks_after = self.after(20, self._drain_ui_callbacks)
+
     def _show_clip(self, clip: Clip, at_seconds: float) -> None:
+        if self._playing:
+            return
+        self._preview_generation += 1
+        generation = self._preview_generation
         self.status.set(f"Loading preview: {clip.name}")
 
         def worker() -> None:
             try:
                 frame = extract_sample_frame(clip, at_seconds)
             except (OSError, RuntimeError) as error:
-                self.after(0, lambda: self._show_error("Preview failed", str(error)))
+                details = str(error)
+                self._post_to_ui(
+                    lambda: self._finish_source_preview(
+                        generation, clip.name, None, details
+                    )
+                )
                 return
-            self.after(0, lambda: self._set_preview(frame, clip.name))
+            self._post_to_ui(
+                lambda: self._finish_source_preview(generation, clip.name, frame)
+            )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_source_preview(
+        self,
+        generation: int,
+        name: str,
+        frame: bytes | None,
+        error: str | None = None,
+    ) -> None:
+        if generation != self._preview_generation or self._playing:
+            return
+        if error is not None:
+            self._show_error("Preview failed", error)
+            return
+        if frame is not None:
+            self._set_preview(frame, name)
 
     def _set_preview(self, frame: bytes, name: str, update_status: bool = True) -> None:
         try:
@@ -915,10 +1123,20 @@ class VideoEditor(tk.Tk):
             return
         image = self.preview_image
         width, height = max(1, self.preview.winfo_width()), max(1, self.preview.winfo_height())
-        factor = max(image.width() / width, image.height() / height, 1)
-        if factor > 1:
-            image = image.subsample(int(factor), int(factor))
-        self.preview.create_image(width // 2, height // 2, image=image, anchor="center")
+        scale = max(
+            1,
+            (image.width() + width - 1) // width,
+            (image.height() + height - 1) // height,
+        )
+        self.preview_display_image = (
+            image.subsample(scale, scale) if scale > 1 else image
+        )
+        self.preview.create_image(
+            width // 2,
+            height // 2,
+            image=self.preview_display_image,
+            anchor="center",
+        )
 
     def generate_edit(self) -> None:
         if self._busy:
@@ -937,13 +1155,13 @@ class VideoEditor(tk.Tk):
             if not os.environ.get("OPENAI_API_KEY"):
                 messagebox.showerror(
                     "Missing API key",
-                    "Set OPENAI_API_KEY in the environment before using cloud vision.",
+                    "Set OPENAI_API_KEY in the environment before using GPT vision via the API.",
                 )
                 return
             endpoint = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
             if not messagebox.askyesno(
                 "Upload sample frames?",
-                f"Cloud vision will upload up to three sampled frames per asset to "
+                f"GPT vision will upload up to three sampled frames per asset to "
                 f"{endpoint}. Continue?",
             ):
                 return
@@ -963,16 +1181,19 @@ class VideoEditor(tk.Tk):
                 else:
                     items = local_prompt_plan(clips, prompt)
                     reasons = []
-                self.after(0, lambda: self._apply_generated(items, reasons, use_cloud))
+                self._post_to_ui(lambda: self._apply_generated(items, reasons, use_cloud))
             except (OSError, RuntimeError, ValueError) as error:
-                self.after(0, lambda: self._finish_with_error("Could not generate edit", str(error)))
+                details = str(error)
+                self._post_to_ui(
+                    lambda: self._finish_with_error("Could not generate edit", details)
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_generated(self, items: list[EditItem], reasons: list[str], cloud: bool) -> None:
         self.timeline = items
         self._refresh_timeline(0 if items else None)
-        source = "Cloud vision" if cloud else "Local filename/duration matching"
+        source = "GPT vision API" if cloud else "Local filename/duration matching"
         self.status.set(f"{source} generated {len(items)} clip(s).")
         if reasons:
             messagebox.showinfo("Edit notes", "\n".join(reasons[:8]))
@@ -995,9 +1216,12 @@ class VideoEditor(tk.Tk):
         def worker() -> None:
             try:
                 self._render_mp4(items, Path(output))
-                self.after(0, lambda: self._finish_export(output))
+                self._post_to_ui(lambda: self._finish_export(output))
             except (OSError, RuntimeError, ValueError) as error:
-                self.after(0, lambda: self._finish_with_error("MP4 export failed", str(error)))
+                details = str(error)
+                self._post_to_ui(
+                    lambda: self._finish_with_error("MP4 export failed", details)
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
